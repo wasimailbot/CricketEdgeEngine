@@ -170,267 +170,32 @@ class MainActivity : AppCompatActivity() {
             }
         }.start()
     }
-
     private fun loadHistoricalData(): Boolean {
-        val data = HistoricalData()
-        return try {
-            assets.open("ipl_json.zip").use { input ->
-                ZipInputStream(input).use { zip ->
-                    while (true) {
-                        val entry = zip.nextEntry ?: break
-                        if (!entry.isDirectory && entry.name.lowercase(Locale.US).endsWith(".json")) {
-                            val text = BufferedReader(
-                                InputStreamReader(zip, Charsets.UTF_8)
-                            ).use { it.readText() }
-                            parseMatch(text, data)
-                        }
-                        zip.closeEntry()
+    val data = HistoricalData()
+
+    return try {
+        assets.open("ipl_json.zip").use { input ->
+            ZipInputStream(input).use { zip ->
+                while (true) {
+                    val entry = zip.nextEntry ?: break
+
+                    if (!entry.isDirectory &&
+                        entry.name.lowercase(Locale.US).endsWith(".json")
+                    ) {
+                        val bytes = zip.readBytes()
+                        val text = String(bytes, Charsets.UTF_8)
+                        parseMatch(text, data)
                     }
+
+                    zip.closeEntry()
                 }
             }
-            historical = data
-            data.matches > 0
-        } catch (_: Exception) {
-            false
         }
+
+        historical = data
+        data.matches > 0
+
+    } catch (e: Exception) {
+        false
     }
-
-    private fun parseMatch(text: String, data: HistoricalData) {
-        try {
-            val root = JSONObject(text)
-            val info = root.optJSONObject("info") ?: root
-            val teamsArray = info.optJSONArray("teams") ?: return
-            if (teamsArray.length() < 2) return
-
-            val a = teamsArray.optString(0)
-            val b = teamsArray.optString(1)
-            if (a.isBlank() || b.isBlank()) return
-
-            val outcome = info.optJSONObject("outcome")
-            val winner = outcome?.optString("winner", "") ?: ""
-            if (winner.isBlank()) return
-
-            data.matches++
-            val sa = data.teams.getOrPut(a) { TeamStats() }
-            val sb = data.teams.getOrPut(b) { TeamStats() }
-            sa.matches++
-            sb.matches++
-
-            if (winner == a) sa.wins++
-            else if (winner == b) sb.wins++
-            else return
-
-            val key = pairKey(a, b)
-            data.headToHead[key] = (data.headToHead[key] ?: 0) +
-                if (winner == a) 1 else -1
-        } catch (_: Exception) {
-            // Ignore malformed/non-match JSON files.
-        }
     }
-
-    private fun calculate(
-        team1: String, team2: String, home: String, venue: String, pitch: String,
-        tossWinner: String, tossDecision: String, dew: String, rain: String,
-        temperatureText: String, humidityText: String, windText: String
-    ) {
-        if (team1 == team2) {
-            resultText.text = "Please select two different teams."
-            return
-        }
-
-        if (!dataLoaded || dataLoading) {
-            resultText.text = "Historical IPL database is still loading. Please wait a moment."
-            return
-        }
-
-        val s1 = historical.teams[team1]
-        val s2 = historical.teams[team2]
-        val p1 = historicalRate(s1)
-        val p2 = historicalRate(s2)
-
-        var score = logit(p1) - logit(p2)
-        val reasons = mutableListOf<String>()
-
-        if (s1 != null && s2 != null) {
-            val h2h = historical.headToHead[pairKey(team1, team2)] ?: 0
-            if (h2h != 0) {
-                score += 0.08 * h2h.coerceIn(-8, 8)
-                reasons += "historical head-to-head"
-            }
-        }
-
-        if (home == team1) {
-            score += 0.12
-            reasons += "home advantage for $team1"
-        }
-        if (home == team2) {
-            score -= 0.12
-            reasons += "home advantage for $team2"
-        }
-
-        if (tossWinner == team1) {
-            score += if (tossDecision == "Field First") 0.07 else 0.04
-            reasons += "toss edge for $team1"
-        } else if (tossWinner == team2) {
-            score -= if (tossDecision == "Field First") 0.07 else 0.04
-            reasons += "toss edge for $team2"
-        }
-
-        when (pitch) {
-            "Batting Friendly" -> {
-                score *= 0.97
-                reasons += "batting-friendly pitch"
-            }
-            "Bowling Friendly", "Pace Friendly", "Spin Friendly" -> {
-                score *= 1.02
-                reasons += pitch.lowercase(Locale.US)
-            }
-        }
-
-        when (dew) {
-            "High" -> {
-                score += if (tossDecision == "Field First") 0.04 else -0.02
-                reasons += "high dew"
-            }
-            "Medium" -> score += if (tossDecision == "Field First") 0.02 else -0.01
-        }
-
-        when (rain) {
-            "High Risk" -> {
-                score *= 0.92
-                reasons += "high rain/DLS uncertainty"
-            }
-            "Medium Risk" -> {
-                score *= 0.97
-                reasons += "medium rain uncertainty"
-            }
-        }
-
-        val temperature = temperatureText.toDoubleOrNull()
-        val humidity = humidityText.toDoubleOrNull()
-        val wind = windText.toDoubleOrNull()
-
-        if (temperature != null && temperature in 34.0..50.0) {
-            score *= 0.98
-            reasons += "high temperature"
-        }
-        if (humidity != null && humidity >= 80.0) {
-            score *= 0.99
-            reasons += "high humidity"
-        }
-        if (wind != null && wind >= 25.0) {
-            score *= 0.98
-            reasons += "strong wind"
-        }
-
-        val probability1 = sigmoid(score).coerceIn(0.05, 0.95)
-        val probability2 = 1.0 - probability1
-
-        resultText.text = buildString {
-            append("${team1.uppercase()}  ${formatPct(probability1)}\n")
-            append("${team2.uppercase()}  ${formatPct(probability2)}\n\n")
-            append("Historical sample: ${s1?.matches ?: 0} matches for $team1; ")
-            append("${s2?.matches ?: 0} for $team2.\n")
-            append("Model input: bundled IPL historical JSON.\n\n")
-            append("This is a statistical estimate, not a guarantee or betting advice.\n")
-            if (reasons.isNotEmpty()) {
-                append("\nApplied context: ${reasons.distinct().joinToString(", ")}.")
-            }
-        }
-    }
-
-    private fun historicalRate(stats: TeamStats?): Double {
-        if (stats == null || stats.matches == 0) return 0.5
-        return ((stats.wins.toDouble() + 2.0) / (stats.matches.toDouble() + 4.0))
-            .coerceIn(0.05, 0.95)
-    }
-
-    private fun pairKey(a: String, b: String): String =
-        if (a < b) "$a|||$b" else "$b|||$a"
-
-    private fun logit(p: Double): Double = kotlin.math.ln(p / (1.0 - p))
-    private fun sigmoid(x: Double): Double = 1.0 / (1.0 + kotlin.math.exp(-x))
-
-    private fun formatPct(value: Double): String =
-        String.format(Locale.US, "%.1f%%", value * 100.0)
-
-    private fun addNumberField(
-        root: LinearLayout,
-        label: String,
-        hint: String
-    ): EditText {
-        addLabel(root, label)
-        val field = EditText(this).apply {
-            this.hint = hint
-            inputType = 2
-        }
-        root.addView(field, matchParams())
-        return field
-    }
-
-    private fun addTitle(root: LinearLayout, text: String) {
-        val title = TextView(this).apply {
-            this.text = text
-            textSize = 28f
-            setTextColor(Color.BLACK)
-            gravity = Gravity.CENTER
-            setPadding(0, 0, 0, 8)
-        }
-        root.addView(title, matchParams())
-    }
-
-    private fun addSubtitle(root: LinearLayout, text: String) {
-        val subtitle = TextView(this).apply {
-            this.text = text
-            textSize = 16f
-            gravity = Gravity.CENTER
-            setPadding(0, 0, 0, 24)
-        }
-        root.addView(subtitle)
-    }
-
-    private fun addSection(root: LinearLayout, text: String) {
-        val section = TextView(this).apply {
-            this.text = text
-            textSize = 20f
-            setTextColor(Color.rgb(30, 80, 160))
-            setPadding(0, 28, 0, 12)
-        }
-        root.addView(section)
-    }
-
-    private fun addLabel(root: LinearLayout, text: String) {
-        val label = TextView(this).apply {
-            this.text = text
-            textSize = 15f
-            setPadding(0, 12, 0, 4)
-        }
-        root.addView(label)
-    }
-
-    private fun addSpinner(
-        root: LinearLayout,
-        labelText: String,
-        values: Array<String>
-    ): Spinner {
-        addLabel(root, labelText)
-        val spinner = Spinner(this)
-        val adapter = ArrayAdapter(
-            this,
-            android.R.layout.simple_spinner_item,
-            values
-        )
-        adapter.setDropDownViewResource(
-            android.R.layout.simple_spinner_dropdown_item
-        )
-        spinner.adapter = adapter
-        root.addView(spinner, matchParams())
-        return spinner
-    }
-
-    private fun matchParams(): LinearLayout.LayoutParams =
-        LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT,
-            ViewGroup.LayoutParams.WRAP_CONTENT
-        )
-}
